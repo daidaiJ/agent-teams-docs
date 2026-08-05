@@ -1,9 +1,11 @@
 # Team Controller 调谐耗时定位与观测排查方案
 
-> 文档版本: v1.0
+> 文档版本: v1.2
 > 日期: 2026-08-05
 > 基线代码: `AgentTeams` HEAD（`48ce4aa` / `c01aaec` 修复后，含 per-step timing logs 与可配置并发）
 > 关联文档: [team-controller-performance.md](team-controller-performance.md)（修复前分析）、[team-controller-defects.md](team-controller-defects.md)（缺陷清单）
+> v1.1 新增: S3 层根因复现基准（第 6 节）、控制器调用方式 vs S3 基座两轨优化对照（第 7 节）
+> v1.2 更新: 适配云 S3 部署（底层为服务商 OSS）——VPC 内网 endpoint 优先（E6b）、限流排查（E8）、SeaweedFS 降级为自建评估
 
 ---
 
@@ -547,12 +549,703 @@ echo "    kubectl cp <controller-pod>:$OUT.tar.gz ./"
 
 ---
 
-## 6. 后续行动建议
+## 6. mc 确认后：S3 层根因定位与复现基准（bench）
+
+**前提**：第 1.3/1.4 节已确认 config 阶段耗时为 mc 调用主导（runMC 阈值日志显示单次 >300ms），第 2.2 节"存储规模正反馈"机制成立。本节用**可控复现基准**把瓶颈拆到具体层，回答三个问题：
+
+1. 瓶颈在**调用模式**（exec fork / 新 TLS 连接 / 无连接池）还是 **S3 服务端**？
+2. 瓶颈是否随**对象规模 / 对象大小 / 并发**放大（复现"team 越多越慢"）？
+3. 自建 SeaweedFS 替换云 S3 是否值得（默认不做，降级动作）？
+
+### 6.1 复现负载：对齐真实调用模式
+
+代码事实（当前 HEAD）：
+
+| 事实 | 位置 |
+|------|------|
+| 探活走 `GetObject` = `mc cat` **全量下载**，内容丢弃 | `deployer.go:479`（seedLocalAgentFiles）、`:263`（SOUL.md）、`:362`（AGENTS.md）、`:862`（pushBuiltinTopLevelFiles） |
+| `PutObject` = 写临时文件 + `mc cp` | `minio.go:88~96` |
+| 每成员每轮调谐 10~20 次调用，**GET 为主** | 见 1.3 节表 |
+
+**bench 负载**：每"成员轮次" = 12 GET + 3 PUT + 2 STAT + 1 LIST（18 次调用，GET 主导），轮次墙钟耗时直接对标真实 config 阶段。
+
+**测试量不需要大**：环境里其他 team 的 worker 每 5min 周期调谐、事件触发调谐，本身就在向 S3 持续打负载。bench 是**搭车测量**——用小样本（默认 rounds=10、workers=1,5）测"真实背景负载叠加下"的单次调用延迟，而非自己制造负载。加大 rounds/workers 只会增加对环境的冲击，不增加信息量；更有意义的变量是**时段**（调谐高峰 vs 低谷各跑一次对比）。
+
+### 6.2 bench_s3.go：双驱动 + 真实桶复用
+
+单文件 Go 程序，两个驱动跑**同一份负载**：
+
+| 驱动 | 实现 | 对应生产路径 |
+|------|------|-------------|
+| `mc` | 每次调用 `exec.CommandContext("mc", ...)`（PUT 先写临时文件） | `minio.go` 现状 |
+| `sdk` | minio-go 连接池直连 | performance 文档 6.3.1 优化方案 |
+
+**复用场景桶，不预置负载**（省 seed 成本、零污染）：
+
+| 空间 | 范围 | 操作 | 说明 |
+|------|------|------|------|
+| 读空间 | `-prefix` 下采样的真实 key（`-probe-n` 个） | stat / get / list | 只读，不修改任何数据；key 大小/分布即真实 |
+| 写空间 | `bench-probe/` 前缀（固定 16 个 key） | put | 前缀隔离，跑完 `-clean` 清理；`-write=false` 完全关闭 |
+| 规模 | `background` 列 | — | 云 S3 全桶 LIST 分页贵且耗 QPS，默认 `-count=false` 用控制台对象数；换 `-bucket/-prefix` 即规模对比实验 |
+
+实验维度由 flag 控制：操作类型（`-ops`）、并发 worker（`-workers`）、对象大小（`-write-size`，写空间）、网络/后端（`-endpoint`：公网 vs OSS VPC 内网 `-internal` endpoint，或自建评估时才换引擎）。
+
+```go
+// bench_s3.go — S3 层瓶颈复现基准 v2（复用真实桶，不预置负载）
+//
+// 设计: 不向桶里压入测试对象（省 seed 成本），直接复用场景中已有的 S3 桶:
+//   - 读空间: 从 -prefix 下采样真实 key 池，做 stat/get/list（只读，零污染）
+//   - 写空间: bench-probe/ 前缀，做 put（-write=false 关闭），跑完 -clean 清理
+//   - 操作类型对比（主目标）: 在环境背景调谐压力下，对比 stat/get/put/list
+//     各类型的单次调用延迟分布，直接暴露"哪种类型负载最耗时"（E7 主实验）
+//   - 调用模式对比: mc vs sdk 同负载对比，量化 exec/TLS/无连接池开销（E1 辅助）
+//   - 背景规模: 启动时全桶统计对象数记入 CSV（background 列）；云 S3 全桶 LIST
+//     分页开销大且耗 QPS，默认关闭（-count=false），用 OSS 控制台对象数代替；
+//     用同一命令换 -bucket/-prefix 指向不同规模桶即规模效应实验（E2）
+//   - 测试量小: 环境里其他 team 的 worker 每 5min 周期调谐/事件调谐本身就在
+//     持续打 S3 负载，bench 只做小样本"搭车测量"，无需大 rounds/workers
+//
+// 用法:
+//   go mod init bench-s3 && go get github.com/minio/minio-go/v7
+//   # 对场景桶跑完整负载（mc vs sdk，含写路径，跑完自动清 bench-probe/）:
+//   go run bench_s3.go -endpoint http://127.0.0.1:9000 -ak minioadmin -sk minioadmin \
+//     -bucket hiclaw -prefix agents/ -mc /usr/local/bin/mc -alias bench \
+//     -drivers mc,sdk -workers 1,5 -rounds 10
+//   # 只读探测（不改动桶任何数据）:
+//   ... 同参数 -write=false
+//   # 规模对比: 同一命令换 -bucket/-prefix 指向不同规模桶，对比 CSV 的 background 列
+//   # 背景负载强度对比: 同一桶在调谐高峰/低谷时段各跑一次（比加大 rounds 更有意义）
+//   # 冷启动数据: -warmup 0
+//
+// 输出 CSV 到 stdout: driver,background,workers,op,count,avg_ms,p50_ms,p95_ms,p99_ms
+// op=round 行 = 每成员轮次（默认 12 GET + 3 PUT + 2 STAT + 1 LIST）墙钟耗时，
+// 直接对标真实 config 阶段。
+//
+// 注意: 对生产桶跑 bench 会向生产存储打真实负载，建议低 rounds 或非高峰时段。
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/csv"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+// 默认轮次配比: 对齐 DeployWorkerConfig 每成员每轮的真实操作配比（GET 主导）
+const (
+	poolSize   = 64 // 真实 key 采样池上限
+	probeWrite = 16 // 写空间 key 数（bench-probe/ 前缀）
+)
+
+var (
+	flagEndpoint = flag.String("endpoint", "http://127.0.0.1:9000", "S3 endpoint（scheme 决定 TLS，换 endpoint 即换引擎/网络实验）")
+	flagAK       = flag.String("ak", "minioadmin", "access key")
+	flagSK       = flag.String("sk", "minioadmin", "secret key")
+	flagBucket   = flag.String("bucket", "hiclaw", "被测桶（场景真实桶，读空间不修改任何数据）")
+	flagPrefix   = flag.String("prefix", "agents/", "被测真实 key 前缀（读空间采样范围）")
+	flagOps      = flag.String("ops", "stat,get,put,list", "操作类型集合: stat,get,put,list")
+	flagWrite    = flag.Bool("write", true, "写路径测试（put 写到 bench-probe/ 前缀，跑完清理）")
+	flagWriteSz  = flag.Int("write-size", 8192, "写空间对象大小字节（E3 对象大小实验用）")
+	flagMC       = flag.String("mc", "mc", "mc 二进制路径")
+	flagAlias    = flag.String("alias", "bench", "mc alias 名")
+	flagDrivers  = flag.String("drivers", "mc,sdk", "驱动（逗号分隔）: mc=子进程现状, sdk=minio-go 连接池")
+	flagWorkers  = flag.String("workers", "1,5", "并发 worker 数（逗号分隔）；小样本即可，环境自身调谐就是负载")
+	flagRounds   = flag.Int("rounds", 10, "每 worker 正式计时的轮次数（小样本，背景负载由其他 team 调谐提供）")
+	flagWarmup   = flag.Int("warmup", 2, "正式计时前的预热轮次（抹平服务端缓存顺序偏差）")
+	flagClean    = flag.Bool("clean", true, "run 结束时清理写空间 bench-probe/（防残留污染）")
+	flagProbeN   = flag.Int("probe-n", 64, "真实 key 采样池大小")
+	flagCount    = flag.Bool("count", false, "全桶统计对象数（云 S3 上 LIST 分页贵，默认关，用控制台对象数）")
+)
+
+type rec struct {
+	driver     string
+	background int // 桶内真实对象总数（CSV background 列）
+	workers    int
+	op         string // get/put/stat/list/round
+	ms         []float64
+}
+
+func main() {
+	flag.Parse()
+	ws := parseInts(*flagWorkers)
+	drvs := strings.Split(*flagDrivers, ",")
+	ops := parseOps(*flagOps)
+
+	ctx := context.Background()
+	sdk := newSDK()
+	ensureBucket(ctx, sdk)
+	setupMC() // mc alias set（仅一次，对齐生产静态凭据模式）
+
+	// 背景规模: 默认不统计（云 S3 全桶 LIST 分页贵且耗 QPS），-count 开启；
+	// 推荐直接用 OSS 控制台的对象数
+	background := -1
+	if *flagCount {
+		background = countObjects(ctx, sdk)
+	}
+	fmt.Fprintf(os.Stderr, "bucket %q background=%d (-count 开启全桶统计；云 S3 建议用控制台对象数)\n", *flagBucket, background)
+
+	// 读空间: 从真实前缀采样 key 池（不修改任何数据）
+	readKeys := sampleKeys(ctx, sdk, *flagPrefix, *flagProbeN)
+	if len(readKeys) == 0 {
+		fmt.Fprintf(os.Stderr, "fatal: prefix %q 下没有对象\n", *flagPrefix)
+		os.Exit(1)
+	}
+
+	// 写空间 key（bench-probe/ 前缀，跑完清理）
+	writeKeys := make([]string, probeWrite)
+	for i := range writeKeys {
+		writeKeys[i] = fmt.Sprintf("bench-probe/%03d", i)
+	}
+	writeBlob := make([]byte, *flagWriteSz)
+	rand.New(rand.NewSource(42)).Read(writeBlob)
+
+	tmpDir, err := os.MkdirTemp("", "bench-s3-")
+	must(err)
+	defer os.RemoveAll(tmpDir)
+
+	var all []*rec
+	for _, w := range ws {
+		for _, d := range drvs {
+			for _, r := range benchOnce(ctx, d, sdk, w, ops, readKeys, writeKeys, writeBlob, tmpDir) {
+				r.background = background
+				r.workers = w
+				all = append(all, r)
+			}
+		}
+	}
+	writeCSV(all)
+	writeSummary(all) // 人眼可读的操作类型对比（主目标输出）
+
+	if *flagClean {
+		// 只清写空间，不动真实数据
+		cleanPrefix(ctx, sdk, "bench-probe/")
+	}
+}
+
+// parseOps 把 "stat,get,put,list" 解析为集合；put 受 -write 开关控制
+func parseOps(s string) map[string]bool {
+	m := map[string]bool{}
+	for _, o := range strings.Split(s, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" && (o == "stat" || o == "get" || o == "put" || o == "list") {
+			m[o] = true
+		}
+	}
+	if !*flagWrite {
+		delete(m, "put")
+	}
+	return m
+}
+
+// benchOnce 以 W 个并发 worker 各跑 rounds 轮，返回各 op 与 round 的耗时样本
+func benchOnce(ctx context.Context, drv string, sdk *minio.Client, workers int, ops map[string]bool, readKeys, writeKeys []string, blob []byte, tmpDir string) []*rec {
+	// 每轮配比（对齐生产 config 阶段: GET 主导，12 GET + 3 PUT + 2 STAT + 1 LIST）
+	var mix []string
+	if ops["get"] {
+		for i := 0; i < 12; i++ {
+			mix = append(mix, "get")
+		}
+	}
+	if ops["put"] {
+		for i := 0; i < 3; i++ {
+			mix = append(mix, "put")
+		}
+	}
+	if ops["stat"] {
+		for i := 0; i < 2; i++ {
+			mix = append(mix, "stat")
+		}
+	}
+	if ops["list"] {
+		mix = append(mix, "list")
+	}
+
+	var mu sync.Mutex
+	times := map[string][]float64{}
+	var roundMs []float64
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w)))
+			tmp := filepath.Join(tmpDir, fmt.Sprintf("put-%d.tmp", w))
+			for r := 0; r < *flagWarmup+*flagRounds; r++ {
+				rstart := time.Now()
+				for _, op := range mix {
+					start := time.Now()
+					var err error
+					switch op {
+					case "get":
+						err = opGet(ctx, drv, sdk, readKeys[rng.Intn(len(readKeys))])
+					case "put":
+						err = opPut(ctx, drv, sdk, writeKeys[rng.Intn(len(writeKeys))], blob, tmp)
+					case "stat":
+						err = opStat(ctx, drv, sdk, readKeys[rng.Intn(len(readKeys))])
+					case "list":
+						err = opList(ctx, drv, sdk)
+					}
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "fatal: %s %s: %v\n", drv, op, err)
+						os.Exit(1)
+					}
+					elapsed := time.Since(start).Seconds() * 1000
+					if r < *flagWarmup {
+						continue // 预热轮: 不记录，让服务端缓存进入热态
+					}
+					mu.Lock()
+					times[op] = append(times[op], elapsed)
+					mu.Unlock()
+				}
+				if r < *flagWarmup {
+					continue
+				}
+				mu.Lock()
+				roundMs = append(roundMs, time.Since(rstart).Seconds()*1000)
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	var out []*rec
+	for _, op := range []string{"get", "put", "stat", "list"} {
+		if len(times[op]) > 0 {
+			out = append(out, &rec{driver: drv, op: op, ms: times[op]})
+		}
+	}
+	out = append(out, &rec{driver: drv, op: "round", ms: roundMs})
+	return out
+}
+
+// ---- 两个驱动：mc 子进程（现状）与 minio-go SDK（优化方案）----
+
+func mcRun(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, *flagMC, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mc %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func opGet(ctx context.Context, drv string, sdk *minio.Client, key string) error {
+	switch drv {
+	case "mc":
+		return mcRun(ctx, "cat", *flagAlias+"/"+*flagBucket+"/"+key)
+	case "sdk":
+		obj, err := sdk.GetObject(ctx, *flagBucket, key, minio.GetObjectOptions{})
+		if err != nil {
+			return err
+		}
+		defer obj.Close()
+		_, err = io.Copy(io.Discard, obj)
+		return err
+	}
+	return fmt.Errorf("unknown driver %q", drv)
+}
+
+func opPut(ctx context.Context, drv string, sdk *minio.Client, key string, blob []byte, tmp string) error {
+	switch drv {
+	case "mc":
+		// 镜像 minio.go PutObject: 先写临时文件再 mc cp
+		if err := os.WriteFile(tmp, blob, 0o644); err != nil {
+			return err
+		}
+		return mcRun(ctx, "cp", tmp, *flagAlias+"/"+*flagBucket+"/"+key)
+	case "sdk":
+		_, err := sdk.PutObject(ctx, *flagBucket, key, bytes.NewReader(blob), int64(len(blob)), minio.PutObjectOptions{})
+		return err
+	}
+	return fmt.Errorf("unknown driver %q", drv)
+}
+
+func opStat(ctx context.Context, drv string, sdk *minio.Client, key string) error {
+	switch drv {
+	case "mc":
+		return mcRun(ctx, "stat", *flagAlias+"/"+*flagBucket+"/"+key)
+	case "sdk":
+		_, err := sdk.StatObject(ctx, *flagBucket, key, minio.StatObjectOptions{})
+		return err
+	}
+	return fmt.Errorf("unknown driver %q", drv)
+}
+
+func opList(ctx context.Context, drv string, sdk *minio.Client) error {
+	switch drv {
+	case "mc":
+		return mcRun(ctx, "ls", *flagAlias+"/"+*flagBucket+"/"+*flagPrefix)
+	case "sdk":
+		// 取首响应即返回: LIST 延迟 = 服务端返回首个条目耗时（非全量遍历）
+		for obj := range sdk.ListObjects(ctx, *flagBucket, minio.ListObjectsOptions{Prefix: *flagPrefix}) {
+			if obj.Err != nil {
+				return obj.Err
+			}
+			break
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown driver %q", drv)
+}
+
+// ---- 初始化与工具 ----
+
+func newSDK() *minio.Client {
+	secure := strings.HasPrefix(*flagEndpoint, "https://")
+	host := strings.TrimPrefix(*flagEndpoint, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	c, err := minio.New(host, &minio.Options{
+		Creds:  credentials.NewStaticV4(*flagAK, *flagSK, ""),
+		Secure: secure,
+	})
+	must(err)
+	return c
+}
+
+func ensureBucket(ctx context.Context, sdk *minio.Client) {
+	exists, err := sdk.BucketExists(ctx, *flagBucket)
+	must(err)
+	if !exists {
+		fmt.Fprintf(os.Stderr, "fatal: bucket %q 不存在（bench 不创建桶，只复用场景已有桶）\n", *flagBucket)
+		os.Exit(1)
+	}
+}
+
+func setupMC() {
+	if err := mcRun(context.Background(), "alias", "set", *flagAlias, *flagEndpoint, *flagAK, *flagSK); err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+
+// countObjects 全桶统计对象数（一次 LIST 递归遍历，服务端负担远小于预置负载）
+func countObjects(ctx context.Context, sdk *minio.Client) int {
+	n := 0
+	for obj := range sdk.ListObjects(ctx, *flagBucket, minio.ListObjectsOptions{Recursive: true}) {
+		if obj.Err != nil {
+			fmt.Fprintf(os.Stderr, "list warning: %v\n", obj.Err)
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// sampleKeys 从真实前缀采样至多 n 个 key 作为读空间（只读，不修改任何数据）
+func sampleKeys(ctx context.Context, sdk *minio.Client, prefix string, n int) []string {
+	var keys []string
+	for obj := range sdk.ListObjects(ctx, *flagBucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if obj.Err != nil {
+			fmt.Fprintf(os.Stderr, "list warning: %v\n", obj.Err)
+			break
+		}
+		keys = append(keys, obj.Key)
+		if len(keys) >= n {
+			break
+		}
+	}
+	return keys
+}
+
+// cleanPrefix 删除指定前缀下全部对象（prefix="" 即清空整个 bucket）。
+// 用 SDK 批量删除（LIST + 批量 DELETE），不用 mc，避免 bench 依赖清理路径。
+func cleanPrefix(ctx context.Context, sdk *minio.Client, prefix string) {
+	objectsCh := sdk.ListObjects(ctx, *flagBucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true})
+	removeCh := sdk.RemoveObjects(ctx, *flagBucket, objectsCh, minio.RemoveObjectsOptions{})
+	for e := range removeCh {
+		if e.Err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup warning: %v\n", e.Err)
+		}
+	}
+}
+
+func writeCSV(recs []*rec) {
+	w := csv.NewWriter(os.Stdout)
+	_ = w.Write([]string{"driver", "background", "workers", "op", "count", "avg_ms", "p50_ms", "p95_ms", "p99_ms"})
+	for _, r := range recs {
+		if len(r.ms) == 0 {
+			continue
+		}
+		sorted := append([]float64(nil), r.ms...)
+		sort.Float64s(sorted)
+		var sum float64
+		for _, v := range sorted {
+			sum += v
+		}
+		_ = w.Write([]string{
+			r.driver, strconv.Itoa(r.background), strconv.Itoa(r.workers), r.op,
+			strconv.Itoa(len(sorted)),
+			strconv.FormatFloat(sum/float64(len(sorted)), 'f', 1, 64),
+			strconv.FormatFloat(pct(sorted, 0.50), 'f', 1, 64),
+			strconv.FormatFloat(pct(sorted, 0.95), 'f', 1, 64),
+			strconv.FormatFloat(pct(sorted, 0.99), 'f', 1, 64),
+		})
+	}
+	w.Flush()
+}
+
+// writeSummary 输出人眼可读的操作类型对比（主目标: 背景压力下哪种负载最耗时）
+func writeSummary(recs []*rec) {
+	type agg struct {
+		avg, p50, p95 float64
+	}
+	by := map[string]map[string]agg{} // driver -> op -> agg
+	for _, r := range recs {
+		if len(r.ms) == 0 {
+			continue
+		}
+		sorted := append([]float64(nil), r.ms...)
+		sort.Float64s(sorted)
+		var sum float64
+		for _, v := range sorted {
+			sum += v
+		}
+		if by[r.driver] == nil {
+			by[r.driver] = map[string]agg{}
+		}
+		by[r.driver][r.op] = agg{sum / float64(len(sorted)), pct(sorted, 0.50), pct(sorted, 0.95)}
+	}
+	fmt.Fprintln(os.Stderr, "\n== 操作类型对比（背景压力下单次调用延迟 ms；round=一成员轮次墙钟）==")
+	for d, ops := range by {
+		fmt.Fprintf(os.Stderr, "driver=%s\n", d)
+		fmt.Fprintf(os.Stderr, "  %-6s %9s %9s %9s\n", "op", "avg", "p50", "p95")
+		for _, op := range []string{"stat", "get", "put", "list", "round"} {
+			if a, ok := ops[op]; ok {
+				fmt.Fprintf(os.Stderr, "  %-6s %9.1f %9.1f %9.1f\n", op, a.avg, a.p50, a.p95)
+			}
+		}
+	}
+}
+
+func pct(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(p * float64(len(sorted)))
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func parseInts(s string) []int {
+	var out []int
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.Atoi(p)
+		must(err)
+		out = append(out, v)
+	}
+	return out
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+```
+
+### 6.3 实验卫生：防"隐形增量/缓存"污染
+
+复用真实桶后，污染面比预置负载版小得多，但仍需处理：
+
+| 污染源 | 表现 | 处理 |
+|--------|------|------|
+| **写空间残留** | 上次 run 的 `bench-probe/` 对象残留，PUT 覆盖写导致对象数/大小漂移 | `-clean`（默认 true）run 结束时清理 `bench-probe/` 前缀；读空间从不写 |
+| **缓存热效应** | 先跑的驱动/实验把对象喂进服务端缓存（OS page cache / MinIO 缓存），后跑者"沾光"，mc vs sdk 差异被夸大 | `-warmup`（默认 2 轮）正式计时前先跑预热轮不记录，两个驱动都在热态对比 |
+| **时段漂移** | 不同时段背景调谐负载强度不同（周期调谐错峰），跨时段对比失真 | 对比实验（如 mc vs sdk、不同桶规模）尽量在同一时段连续跑；需要负载强度数据时，高峰/低谷各跑一次并记录时间 |
+
+说明：
+- 预热测的是**稳态性能**，贴近生产真实场景——生产对象本来就被每 5min 周期调谐反复访问，属热对象；如需"首次建队"的冷启动数据，加 `-warmup 0`；
+- 清理只针对 `bench-probe/` 前缀（SDK 批量删除），**从不触碰真实数据**；
+- 对生产桶跑 bench 会向生产存储叠加少量真实负载（小样本下可忽略），建议低 rounds 或非高峰时段。
+
+### 6.4 实验矩阵与判读
+
+> 顺序即推荐执行顺序。**E7 是主实验**：一次运行即输出全部操作类型在背景压力下的延迟分布，直接回答"哪种类型负载最耗时"；其余实验按需追加定位。
+
+| 实验 | 做法 | 回答的问题 |
+|------|------|-----------|
+| **E7 ★主实验** | 默认参数跑一次（`-drivers mc` 起步），读 stderr 的 writeSummary 输出 | **背景压力下哪种操作类型最耗时**（stat/get/put/list 分布 + round 墙钟） |
+| E1 调用模式 | 同参数补跑 `sdk` 驱动，对比 mc | exec/TLS/无连接池开销占比（若 E7 显示整体都高，此实验定位其中"进程开销"部分） |
+| E0 基线 | `-workers 1`，低峰时段 | 单成员轮次的最小延迟基线 |
+| **E6b ★云 S3 关键** | 公网 endpoint vs OSS **VPC 内网 endpoint**（`-internal`）各跑一次 E7 | **公网路径成本**（RTT+签名），云 S3 场景最高性价比优化依据 |
+| E2 对象规模 | 同一命令换 `-bucket/-prefix` 指向不同规模桶，对比 background 列（云 S3 用控制台对象数） | 规模正反馈是否成立（随 background 上升） |
+| E2b 负载敏感度 | 同一桶在调谐高峰/低谷时段各跑一次 E7 | **哪种操作类型对背景压力最敏感**（延迟放大倍数最大） |
+| E3 对象大小 | 写空间 `-write-size 0,1024,8192,65536` 各跑一次 | 每对象固定开销 vs 传输开销占比（0 点 = 纯协议+元数据成本） |
+| E4 并发 | `-workers 1,5,10` | 服务端在真实背景负载叠加下的并发承受力（为成员并行方案探路；云 S3 关注限流拐点） |
+| E8 限流观察 | 监控 429/503 错误与延迟拐点（低优先级，慎用；勿在生产高峰做） | 云 S3 QPS 限流是否触发 |
+| E5 引擎对比 | 仅当评估**自建** SeaweedFS 时：同参数换 `-endpoint`（云 S3 / SeaweedFS） | 自建替换云托管是否值得（默认不做） |
+| E6 网络/TLS | `http://` vs `https://`（仅自建 MinIO 有意义）、内网 vs 公网 endpoint | 网络层与 TLS 握手开销 |
+
+### 6.5 结果解读决策矩阵
+
+| bench 结果 | 根因 | 针对性解决（指向第 7 节） |
+|-----------|------|---------------------------|
+| E7：**get** 最耗时（探活/读取） | 探活走全量 GET 下载 + 传输路径 | A1（探活改 HEAD）、A2（跳过探活）、B1（网络/内网 endpoint） |
+| E7：**put** 最耗时（写入） | 写路径瓶颈（元数据写/QPS） | B3（升配额）、B4（存储类型）；A 轨减少写入次数 |
+| E7：**list** 最耗时 | LIST 路径瓶颈（目录遍历/registry） | B2（对象治理）、A 轨减少 list 调用 |
+| E7：**stat** 也高（HEAD 慢） | 服务端基础延迟高（非操作类型问题） | E1/E0 定位：调用模式 or 网络基线 |
+| **E6b：内网 endpoint 显著快于公网** | 公网路径成本（RTT+签名+限流） | **B1（切 VPC 内网 endpoint）——云 S3 场景第一优先** |
+| **E8/监控：429/503 或限流事件** | 云 S3 QPS 限流 | B3（升配额/降调用频率）、A2/A3（减调用次数） |
+| E1：`sdk` round 远快于 `mc`（如 5x+） | 调用模式开销（exec+TLS+无复用） | A3（SDK 替换）；**换引擎无效** |
+| E2：round 随 background 显著上升 | 对象规模/元数据效应 | B2（对象治理）；自建评估时才考虑 B5 |
+| E2b：某类型高峰/低谷放大倍数最大 | 该类型对背景压力最敏感（如 put 受并发写放大） | 针对该类型降频/批处理；B 轨对应项 |
+| E3：大小不敏感、每 op 固定成本高 | 每对象固定开销（RTT+签名+元数据） | A3、A1；B1（内网） |
+| E4：并发升高后延迟飙升 | 服务端 QPS 上限/限流 | B3（云 OSS 升配）、A 轨降调用次数 |
+| E5（自建评估）：SeaweedFS 显著快 | 云 S3 单请求成本/限流不可接受 | B5 走 7.4 决策门（自建替换云托管是降级，默认不做） |
+| E6：https 显著慢于 http（仅自建 MinIO 可测） | TLS 握手 | A3（连接池复用）或内网自签 |
+
+### 6.6 服务端侧交叉验证（与 bench 对照）
+
+**云 S3（当前部署，OSS 控制台为准）**：
+
+```bash
+# OSS 控制台监控: 请求数 QPS、平均/最大延迟、错误率、4xx/5xx 分布、限流事件
+#   → 与 bench 时段对齐，看限流/延迟是否与服务端记录一致
+# OSS access log（可开通日志服务）: 每条请求的 request-id、耗时、状态码
+#   → 定位"具体哪个请求慢"（用日志里的 request-id 反查）
+
+# controller 侧对照: 调谐日志里的 429/503 与慢请求
+kubectl logs -n <ns> <controller-pod> | grep -E "429|503|SlowDown|RequestTimeout"
+
+# TCP/TLS 路径（公网 vs 内网对比的量化依据）
+curl -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer}\n" \
+  -o /dev/null -s "https://<bucket>.<region>.aliyuncs.com/<prefix>/<key>"
+```
+
+**仅自建 MinIO 时可用**（当前云 S3 部署不适用，保留备查）：
+
+```bash
+mc admin info ALIAS
+mc admin perf object ALIAS --objects 64 --size 1MiB --concurrent 16
+mc admin perf drive ALIAS                       # 磁盘 IOPS/带宽
+mc admin prometheus metrics ALIAS | grep -E "s3_requests_total|s3_errors_total|s3_.*_duration"
+iostat -x 1                                     # 宿主机磁盘
+```
+
+---
+
+## 7. 解决方案：控制器调用方式优化（A 轨）与 S3 基座优化（B 轨）
+
+> 排序原则：**从简单到困难**；每项给出收益与风险；优先级综合"收益 / 成本 / 风险 / 前置依赖"。
+> 收益基准来自第 1.3 节拆解（单次 mc 200~400ms、每成员 10~20 次调用）。
+
+### 7.1 总览排序表
+
+| 优先级 | 优化项 | 轨 | 难度/工作量 | 预期收益 | 风险 | 前置依赖 |
+|--------|--------|----|------------|----------|------|----------|
+| P0 | ① runMC 阈值耗时日志（>300ms） | A | 半天 | 单次延迟与 op 分布真实基线，量化后续每项收益 | 无 | — |
+| P0 | ② bench_s3 复现基准（第 6 节） | A+B | 半天 | 定位背景压力下耗时最高的负载类型（E7 主实验）+ 调用模式占比（E1 辅助） | 无 | ① |
+| P0 | ③ 探活 GetObject → Stat（HEAD） | A | 半天 | 每成员省 5~15 次全量 GET 下载 | 低 | ①确认探活占比 |
+| P1 | ④ 本地文件变更检测，跳过探活 | A | 1~2天 | 每成员调用 10~20 次 → 3~5 次（-60~70%） | 中低 | ② |
+| P1 | ⑤ minio-go SDK 替换 mc 子进程 | A | 1~2天 | 单次 50~200ms → 5~20ms；消 exec/TLS 风暴 | 中 | ②量化后再改 |
+| P1 | ⑥ 网络基线：**VPC 内网 endpoint**（`-internal`）+ 传输加速 | B | 半天~1天 | 公网 RTT/签名成本 → 内网（云 S3 场景第一优先，E6b 数据说话） | 低 | ②E6b |
+| P2 | ⑦ 成员级并行（errgroup） | A | 2~3天 | team 内调谐 /N | 中 | ⑤（避免并发 exec 风暴）；②E4 |
+| P2 | ⑧ 对象规模治理：孤儿清理 + 生命周期 | B | 1~2天 | 减缓"team 越多越慢"正反馈 | 低 | ②E2 证实规模效应 |
+| P2 | ⑨ 云 OSS：QPS/带宽配额升配 + 限流适配 | B | 1天 | 提限流阈值，消 429/503 | 低（成本） | ②E8 证实限流 |
+| P3 | ⑩ OSS 侧配置：存储类型检查（标准 vs 低频/归档）+ 传输加速 | B | 1天 | 降单请求成本/延迟 | 低 | ② |
+| P3 | ⑪ SeaweedFS 自建迁移 | B | 2~4周 | 引擎级小对象优化（仅当限流/成本不可接受） | **极高**（自建替换云托管=降级） | ②E5 + 7.4 决策门 |
+
+**结论倾向（云 S3 部署）**：当前证据（3m10s、云 OSS 单次 400~800ms+）指向"公网路径 + 调用模式 + QPS 限流"，而非引擎问题。**主战场是 A 轨（降调用次数/换 SDK/探活改 HEAD）+ ⑥切内网 endpoint**；SeaweedFS 自建是放弃云托管的降级动作，仅在限流/成本不可接受且 7.4 决策门全过时才考虑。
+
+### 7.2 A 轨明细：控制器调用方式优化
+
+**A1 探活改 HEAD（③）** — `deployer.go:479/263/362/862` 的 GetObject 仅用于判断存在性，内容直接丢弃。改为 `oss.Stat()`（`minio.go:119` 已有 `mc stat` 实现，缺失返回 `os.ErrNotExist` 语义一致）。收益：全量 GET 下载 → HEAD，省传输与 stdout 捕获。
+
+**A2 减少调用次数（④）** — `seedLocalAgentFiles` 每轮调谐 WalkDir 全量探活。进程内缓存 `key → (本地 size, mtime)`：本地文件未变且远端已推送过 → 跳过探活；兜底：低频全量校验（每 30min 或 spec 变更时）防外部删除。
+
+**A3 SDK 替换（⑤）** — 方案见 performance 文档 6.3.1。补充两点：
+- 动态 STS 凭据模式（`buildMCHostEnv`，external-OSS 部署）：minio-go 需自定义 `credentials.Provider`（`Retrieve` + `IsExpired`），token 过期时重新 Resolve；
+- 收益量化依赖 ②E1：若 sdk 与 mc 差异不大，说明瓶颈在服务端，⑤ 可降级。
+
+**A4 成员级并行（⑦）** — 方案见 performance 文档 6.3.2（errgroup）。前置 ⑤ 的原因：并发 exec mc 会放大进程风暴，SDK 连接池下并发才安全。
+
+**A5 变更驱动（引用）** — TeamStatus ObservedGeneration + Active 短路（performance 文档 6.2.1）落地后，稳态调谐完全不碰 OSS，是所有 A 轨优化的总开关。
+
+### 7.3 B 轨明细：S3 基座优化（云 S3 视角）
+
+**B1 网络基线（⑥，云 S3 场景第一优先）**
+- **VPC 内网 endpoint**：OSS 同 region `-internal` endpoint（如 `oss-cn-hangzhou-internal.aliyuncs.com`）免费、免公网流量费且 RTT 低一个量级；前提是 controller 与 OSS 同 VPC/region，需打通 VPC 与 OSS 的授权关系
+- 传输加速 endpoint：公网跨区场景可选
+- 对照实验：E6b（公网 vs 内网各跑一次 E7）量化收益后再切，避免白改
+
+**B2 对象规模治理（⑧）**
+- 孤儿对象清理：已删除 worker/team 的残留（用 OSS 控制台/`mc ls --recursive` 统计，再定期清理任务）
+- 生命周期：OSS 生命周期规则清理临时/过期对象
+- 对象合并（低优先）：多小文件合并为 bundle 需改 agent 文件布局，风险高、收益中，除非 E2 证实规模是主因
+
+**B3 限流与配额（⑨）** — OSS 控制台确认当前 QPS/带宽配额与限流事件（E8 数据）；升配或降调用频率（A2/A3 减少调用次数，比升配更持久）。限流特征：延迟拐点 + 429/503 + 控制台限流记录。
+
+**B4 OSS 侧配置（⑩）** — 存储类型检查（标准 vs 低频/归档：低频访问读请求收费高且可能延迟高）、同 region 部署确认（bucket 与集群跨 region 是隐藏 RTT 源）、access log 开启（定位慢请求）。
+
+### 7.4 SeaweedFS 迁移专项评估（⑪，云 S3 部署下为"自建替换云托管"）
+
+**为什么会被考虑**：HiClaw 负载（每 worker 几十个小对象、对象数随 team 线性增长）正是 SeaweedFS 的设计目标（LOSF - lots of small files）。SeaweedFS 官方对 MinIO 小文件问题的表述（README 原文）：
+
+> "MinIO did not have optimization for lots of small files. The files were simply stored as is to local disks. Plus the extra meta file and shards for erasure coding, it only amplifies the LOSF problem."
+> "MinIO had multiple disk IO to read one file. SeaweedFS has O(1) disk reads, even for erasure coded files."
+
+官方基准（README，1M 个 1KB 文件）：写 15,708 req/s，随机读 47,019 req/s；WARP 混合 550 obj/s。来源: https://github.com/seaweedfs/seaweedfs
+
+**但当前底层是云 S3，迁移性质完全不同**：SeaweedFS 小对象优势是**自建引擎**层面的，换过去意味着：
+- 放弃云托管（可用性 SLA、备份、容量弹性）→ 自运维 master + volume + filer；
+- 数据出云迁移（`mc mirror` / rclone）+ 回滚方案；
+- 云 OSS 的限流问题通过"自建"绕开，但引入了新的运维与故障面；
+- **若瓶颈是公网路径/调用模式/限流（当前证据指向这些），换 SeaweedFS 无效**——先做 A 轨 + B1 内网，复测后再谈。
+
+**兼容性风险（代码事实 + 待实测项）**：
+
+| 面 | 当前实现 | SeaweedFS 兼容性 | 风险 |
+|----|---------|-----------------|------|
+| 数据面 | `mc cp/cat/stat/rm/ls/mb/mirror`（minio.go:96~199） | 对应 S3 PUT/GET/HEAD/DELETE/LIST/MakeBucket/COPY，核心 API 覆盖 | 低，但需 bench + 兼容用例实测（含 mirror 的 COPY 语义） |
+| 管理面 | `mc admin user/policy create/attach/detach/remove`（minio_admin.go:50~105） | **`mc admin` 是 MinIO Admin API 专属，SeaweedFS 不实现** | **高**：用户/策略管理需整体重写 |
+| 动态凭据 | `MC_HOST_<alias>` 带 STS token（`buildMCHostEnv`，阿里云 OSS STS） | SeaweedFS 无 STS 语义 | 中：凭据体系需重做（静态 AK 或自建认证） |
+| 运维 | 云托管（SLA/备份/弹性） | master + volume + filer 自运维 | 高：运维模型完全变化 |
+| 数据迁移 | 云 S3 | 数据出云 → 自建 | 中：迁移演练 + 回滚 |
+
+**决策门（全部通过才迁移）**：
+1. A 轨 + B1 内网落地后复测：单次调用仍慢且 ②E5（自建评估实验）显示 SeaweedFS 显著快（>2x）；
+2. 限流/成本不可接受且升配无法解决（E8 + 账单数据）；
+3. 兼容性实测清单通过：数据面 9 种 mc 操作逐一验证 + 管理面/凭据重写方案评审；
+4. 迁移演练：数据量级确认、出云 mirror 时长、回滚路径。
+
+**结论**：**不建议自建 SeaweedFS 替换云 S3**。当前证据（云 OSS 单次 400~800ms+）指向公网路径 + 调用模式 + 限流，A 轨 + ⑥切内网 endpoint 即可覆盖大部分收益；SeaweedFS 仅在限流/成本不可接受且决策门全过时才进入评估。
+
+---
+
+## 8. 后续行动建议
 
 | 优先级 | 事项 | 工作量 |
 |--------|------|--------|
 | P0 | 部署带监测日志的版本（第 3 节），收集 step 4 各子阶段真实耗时数据 | 半天 |
 | P0 | 用第 4.2 节 Step 2 写探针确认 CRD 字段问题归属，补齐 `reconcileAttempt`/`phaseTransitionTime` 到 helm CRD yaml | 10 分钟 |
-| P1 | 依据数据决定：`runMC` 阈值日志 → minio-go SDK 替换（消除子进程风暴） | 1~2 天 |
+| P0 | runMC 阈值日志（7.1 ①）确认单次 mc 延迟与 op 分布 | 半天 |
+| P0 | bench_s3 跑 **E7 主实验**（7.1 ②）+ **E6b 公网 vs VPC 内网 endpoint 对照**，产出 writeSummary | 半天 |
+| P1 | 依据数据决定：探活改 HEAD（A1）→ SDK 替换（A3） | 1~2 天 |
+| P1 | **切 VPC 内网 endpoint**（B1，E6b 数据支持后）+ OSS 控制台限流/配额检查（E8） | 半天~1天 |
 | P1 | pprof 构建开关落地（第 5 节），采样调谐热点验证 | 半天 |
-| P2 | `LegacyCompat.mu` registry 读改写加内存缓存 | 半天 |
+| P2 | 减少调用次数（A2）、对象规模治理（B2） | 2~3 天 |
+| P2 | 成员级并行（A4，前置 SDK）、`LegacyCompat.mu` 内存缓存 | 2~3 天 |
+| P3 | SeaweedFS 自建评估（7.4 决策门）：仅限流/成本不可接受时启动，默认不做 | 数据驱动 |
