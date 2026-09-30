@@ -1,10 +1,11 @@
-# aio 沙箱镜像按需拉取：DSec/EROFS 调研与落地可行性
+# aio 沙箱镜像按需拉取：DSec/EROFS 调研与落地可行性（K8s 池模式）
 
-> 文档版本: v1.0
+> 文档版本: v1.1
 > 日期: 2026-09-30
 > 状态: Draft
-> 关联: `opensandbox-aio-isolation-gap-analysis-and-porting.md`（aio 现状）、`opensandbox-vs-cubesandbox-selection.md`（选型背景）
-> 问题: 能否把 aio（All-in-One）Docker 沙箱镜像改成 EROFS 实现按需拉取？参考 DeepSeek DSec 的相关设计。
+> 变更: v1.1 讨论范围收敛为 **K8s 池模式（BatchSandbox / Pool CRD）**，Docker runtime 不在范围内；v1.0 见 git 历史
+> 关联: `opensandbox-aio-isolation-gap-analysis-and-porting.md`（aio 现状与隔离）、`opensandbox-vs-cubesandbox-selection.md`（选型背景）
+> 问题: 能否把 aio（All-in-One）沙箱镜像改成 EROFS 实现按需拉取？参考 DeepSeek DSec 的相关设计。
 
 ---
 
@@ -57,43 +58,64 @@
 2. **内核版本**：fscache 按需 ≥5.17/5.18；file-backed mount、FSDAX 需更新内核；fscache 按需模式正被弃用，长期方案存在内核 API 漂移风险
 3. **底层存储随机小读性能**：DSec 明确指出 3FS "performs poorly on small random I/O"，所以按需读要 "bulk"（大块读 + 元数据预取 + 本地二级缓存）。若后端是普通 registry/HDD，小随机读放大更严重——启动后首跑的 latency tail 不可忽略（eStargz 在 Grab 的实测 25s vs SOCI 5s，随机读密集负载的运行期退化是真实风险）
 4. **访问模式决定收益**：DSec 运行时只访问 4.2%–13.3% 镜像数据；但如果负载首次运行就要全量读（如装 wheel、跑浏览器全量资产），按需加载退化为更慢的全量下载
-5. **K8s 落地**：标准路径是 containerd 的 remote snapshotter 插件（nydus/stargz/soci/overlaybd 都是这个模式），节点需装插件 + 转换/索引工具，runtime 是 CRI-containerd 而非 dockershim
+5. **K8s 落地形态**：标准路径是 containerd 的 remote snapshotter 插件（nydus/stargz/soci/overlaybd 都是同一模式），节点需装插件（DaemonSet）+ 转换/索引工具，runtime 是 CRI-containerd
 6. **工程成本**：纯 EROFS 自研 = 镜像转换管道（whiteout/层折叠）+ 元数据服务/预取 + 缓存淘汰 + snapshotter 插件；DSec 是在 3FS / 38 万并发规模下才值得自研
 
-## 5. aio 沙箱的落地路径
+## 5. 池模式下的镜像分发现状与按需拉取落点
 
-### 5.1 现状
+### 5.1 现状：完全依赖 kubelet 原生拉取
 
-OpenSandbox 目前**没有任何按需拉取代码**（全仓库 grep 无 EROFS/nydus/stargz/dentry 命中）。现有提速手段只有：
+池模式没有任何 server/controller 侧的镜像预热编排：
 
-- 本地镜像缓存复用（`container_ops.py:218-285`，inspect 本地缓存、平台不匹配才重拉）
-- 池预热（BatchSandbox pool + OSEP-0021 异步客户端侧预热）
-- 暂停/恢复的镜像 commit（`kubernetes/charts/opensandbox/values.yaml:16-27` image-committer）
-- Fastlet 预热（OSEP-0007，按 image-cache affinity 排序的 Top-K 调度）
+- Pool 模板原样交给 kubelet（`pool_controller.go:1343-1366`），镜像拉取发生在**每个预热 Pod 调度时**；模板模式默认 `imagePullPolicy: IfNotPresent`（`config.py:766-772`），池模板的 policy 由用户自带
+- image-cache affinity 是 fast-sandbox 后端的内存 Top-K 调度（`oseps/0007-fast-sandbox-runtime-support.md:58`），**池模式不参与**；OSEP-0007 明确边界：池模式"消除了 pod 启动但保留 K8s API 写入和 watch 传播"
+- 分配算法（Spread/Packed）只按空闲 Pod 列表分配，**不看镜像在节点上的分布**——没有跨节点聚合保证
 
-插入点：Docker 路径在 `container_ops.py:182-216` 的 `_pull_image`；K8s 路径在 BatchSandbox 模板 + runtimeClassName（`batchsandbox_provider.py:261`）。
+### 5.2 大镜像（GB 级 aio）在池模式下的首灌成本
 
-### 5.2 关键前提：Docker runtime 拿不到按需拉取
+| 场景 | 成本 | 位置 |
+|---|---|---|
+| 扩池（含首次建池） | `bufferMin` 个新 Pod 各自在被调度节点上全量拉取，直接表现为池 Ready 延迟（`scalePool` 用 notReady 限流） | `pool_controller.go:1110-1196` |
+| Pool 模板更新（新 image tag） | revision 重算 + 全量滚动重建，每个新 Pod 重新拉镜像；`maxUnavailable=25%` 只限并发不减少传输量；多 revision 并存时同一节点可能旧+新镜像两层 | `pool_update.go:29-51`、`pool_controller.go:571` |
+| 多池/多 revision | 同一镜像的重复拉取无跨池去重 | — |
 
-普通 dockerd 无法挂 remote snapshotter（SOCI/Nydus 都是 containerd 插件）。**按需拉取实质上要求 aio 生产部署走 K8s/containerd**——这与 OpenSandbox 自身"secureAccess 仅 K8s 支持"的走向一致，不构成额外架构分叉。
+代码里没有内建缓解（image-committer 是反向的：把沙箱 fs 提交为镜像，`kubernetes/pkg/imagecommitter/doc.go:15-19`），现状只能靠 IfNotPresent + 节点亲和 + 足够大的 buffer 自然摊薄。
 
-### 5.3 推荐路线
+### 5.3 按需拉取的落点：节点级 snapshotter，池模板基本不动
+
+池模式走 K8s + containerd，**SOCI/Nydus 的标准插件形态可以直接套用**，这也是它优于 Docker runtime 之处：
+
+- **节点侧**：安装 nydus-snapshotter 或 soci snapshotter（DaemonSet + containerd 插件配置），对集群是运维动作，不改 OpenSandbox 代码
+- **镜像侧**：
+  - SOCI：对现有 aio 镜像生成 index manifest 推回 registry，**镜像本身不变**，Pool 模板的 image 字段不用改
+  - Nydus：`nydusify convert` 转换后推新 ref，Pool 模板镜像字段换成转换后 ref
+- **池模板侧**：imagePullPolicy / imagePullSecrets 逻辑不变，snapshotter 在 CRI 层接管
+
+### 5.4 按需拉取对池预热语义的改变（需要设计的点）
+
+1. **"池就绪"不再等于"镜像已全量落节点"**：预热 Pod 可在镜像未拉完时进入 Ready，扩池速度与镜像大小解耦——这正是 GB 级 aio 镜像最需要的收益（DSec 数据：eager 全拉慢 1.71×、写盘省 57%）
+2. **claim 后的延迟长尾**：认领沙箱后 workload 首次访问未缓存数据块才触发拉取，浏览器/python 全量资产类首跑可能踩长尾。缓解：claim 前/预热期做**后台预取**（SOCI/Nydus 都支持 cache warm-up），把"按需"变成"预热期按需、认领时已就绪"——与池预热的语义天然契合，比无状态场景好做
+3. **revision 滚动更新受益最大**：按需模式下新 revision 只在数据被读到时拉差异层，滚动重建的传输量从"全镜像 × 新副本数"降为"实际访问的层"
+4. **回收策略联动**：`RecycleStrategy: Restart`（pod exec 重启容器）不涉及镜像；`Delete` 回池重建时按需拉取让重建成本接近于零
+
+### 5.5 推荐路线
 
 | 路线 | 改造成本 | 建议 |
 |---|---|---|
-| **SOCI snapshotter** | 零镜像转换，只需对现有 aio 镜像生成 index；需 K8s + containerd | **推荐起步**：冷启动收益与镜像大小解耦，几 GB 的 aio 镜像受益最大，Fargate 生产验证 |
+| **SOCI snapshotter** | 零镜像转换，生成 index 即可；需 CRI-containerd | **推荐起步**：冷启动收益与镜像大小解耦，几 GB 的 aio 镜像受益最大，Fargate 生产验证 |
 | **Nydus** | `nydusify convert` 一条命令，containerd 插件即插即用 | **推荐的 EROFS 路线**：这是 "EROFS 按需加载" 唯一不用自研的产品化闭环（RAFS on EROFS over fscache），吃到 EROFS 元数据局部性/去重 |
 | eStargz | 生态最普及 | 兜底选项；对浏览器/python 启动后随机读密集的负载，运行期退化风险最高 |
 | DSec 式自研（OCI→EROFS + 按需数据源） | 最高 | 仅当有自建 3FS 级别高吞吐存储后端时考虑 |
 
-### 5.4 结论
+### 5.6 结论
 
-**可行，且与 DSec 场景高度同构**（海量短生命周期沙箱、单容器大镜像、运行时只碰 ~10% 镜像数据、rootfs 只读 + 可写 upper），论文数据已验证收益（eager 全拉慢 1.71×、写流量省 57%）。但对 OpenSandbox，**建议先用 SOCI/Nydus 拿到 80% 收益**，把 "OCI→EROFS + 元数据本地/数据按需" 留作有自建高吞吐存储后端时的进阶路线。
+**可行，且池模式是最适配的宿主**：池预热的"提前建 Pod"语义与按需拉取的"延迟灌数据"天然互补——预热期做后台预取，认领时数据已就绪，两头的收益都拿到。与 DSec 场景高度同构（海量短生命周期沙箱、单容器大镜像、运行时只碰 ~10% 镜像数据），但**不建议复刻 DSec 自研路线**（收益依赖自建 3FS + 自研转换管道，是 38 万并发规模下的工程量），先用 SOCI/Nydus 拿到 80% 收益。
 
-上线前必须做两件事：
+上线前必须做三件事：
 
 1. **实测 aio 镜像首跑随机读 profile**——确认运行时访问比例接近 DSec 的 4%-13%，而不是首跑就要全量读
-2. **规划可写 upper 层的容量**——EROFS 只读，overlayfs upper 落 tmpfs 或本地盘
+2. **规划可写 upper 层的容量**——EROFS 只读，overlayfs upper 落 tmpfs 或本地盘（池模式还要考虑 Pod 驱逐/重建时 upper 的生命周期）
+3. **设计 claim 前的预取策略**——把按需拉取的延迟长尾消化在预热期，而不是认领后的首跑
 
 ## 6. 参考资料
 
