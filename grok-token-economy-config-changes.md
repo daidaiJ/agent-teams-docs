@@ -1,8 +1,8 @@
 # Grok（grok-build fork）token 经济性配置变更
 
-> 文档版本: v1.0
+> 文档版本: v1.1
 > 日期: 2026-11-13
-> 状态: Applied（本机已生效，新会话起）
+> 状态: Applied（本机已生效，新会话起；v1.1 追加 500k 窗口封顶）
 > 关联: 本仓库无；明细审计与对照见 grok-build-proxy 仓库
 > `docs-local/token-economy-audit-2026-11/`（README、follow-up-2026-11-13、
 > cli-design-port-eval-2026-11-13）
@@ -16,6 +16,8 @@
 - 已落三组改动：bash 输出上限 40k；四个大窗口模型的工具结果裁剪改追加式
   （`prune_mode = "append"`）；其中主模型与三个备选模型的 system 提示变更改
   追加式（`system_prompt_update = "in_history"`）。
+- v1.1 追加第四组：四个 1M+ 窗口模型统一封顶 500k，并把自动压缩阈值显式设到
+  80%（400k 触发），避免上下文膨胀。
 - 稳态命中率不会因此变化（实测 98.3% 已经是上限）；收益是**避免少数场景的缓存
   断崖**：长会话越过窗口 50%、会话中途换模型/重建 agent、单次 bash 输出过大。
 - 一个必须记住的坑：配置枚举值是 snake_case。11-12 写的 `"in-history"` 是非法值
@@ -91,13 +93,32 @@ system_prompt_update = "in_history"
 
 | 模型 | 窗口 | prune_mode | system_prompt_update | 说明 |
 |---|---|---|---|---|
-| `relay/deepseek-flash` | 1M | append | in_history | 主模型 |
-| `relay/glm-5.3-flash` | 1M | append | in_history | 本次补 |
-| `relay/gpt-6-luna` | 1.05M | append | in_history | 本次补 |
-| `ocgo-deepseek-v4.1-flash` | 1M | append | in_history | 本次补（responses 后端，probe 已过） |
+| `relay/deepseek-flash` | 500k（封顶） | append | in_history | 主模型 |
+| `relay/glm-5.3-flash` | 500k（封顶） | append | in_history | 本次补 |
+| `relay/gpt-6-luna` | 500k（封顶） | append | in_history | 本次补 |
+| `ocgo-deepseek-v4.1-flash` | 500k（封顶） | append | in_history | 本次补（responses 后端，probe 已过） |
 | `lightvela/auto` | 200k | 默认 rewrite | 默认 off | 小窗口，append 不释放 token，保持默认 |
 
 动机：切换模型时（`/model`、子 agent 绑定）不应回到"原地改写"的旧行为。
+
+### 2.5 上下文窗口封顶 500k + 80% 自动压缩（2026-11-13）
+
+```toml
+context_window = 500000
+auto_compact_threshold_percent = 80
+```
+
+- 四个 1M+ 窗口模型（deepseek-flash / glm-5.3-flash / gpt-6-luna / ocgo）统一
+  封顶 500k；`lightvela/auto`（200k）不动。
+- 本机 10 天最大单轮 345k，封顶不影响常规会话；作用是把"上下文无限膨胀"变成
+  明确上限。
+- 压缩阈值默认 85%，这里显式写 80% → 约 400k 触发自动压缩（比默认早 25k）。
+- 副作用：工具结果裁剪门（窗口 50%）从 512k 降到 250k。`prune_mode = "append"`
+  下裁剪只插入失效标记、不释放 token，但标记插在历史中段，可能带来小幅前缀
+  断点。若长会话命中出现抖动，两个可选项：`[compaction.pruning] enabled = false`
+  （关裁剪，纯靠 400k 压缩收口），或把窗口恢复 1M。
+- 预期：长会话在 400k 附近做一次压缩（一次已知断崖），之后重新累积，不再出现
+  500k+ 的历史。
 
 ---
 
@@ -113,6 +134,8 @@ system_prompt_update = "in_history"
   越过窗口 50% 的会话不应出现整段跌到 0 的轮次。
 - 换模型场景：切到上表任一模型后继续同一会话，观察切换后第一轮命中是否只丢
   新增块，而不是整段前缀。
+- 窗口与压缩：`/context-window` / `/context` 应显示 500k；长会话在约 400k
+  触发自动压缩（80%），而不是默认的 425k；压缩前不应出现 500k+ 的请求。
 
 ---
 
